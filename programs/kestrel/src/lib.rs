@@ -1,12 +1,13 @@
 // Kestrel — trustless conditional-order execution engine for Solana perps.
 //
-// STEP 1 SPINE (this file): create_order (+ fill receipt) -> delegate to ER ->
-// check (crank) -> on trigger: commit + post-commit Magic Action -> settle writes a
-// base-layer Fill receipt. Mirrors magicblock-engine-examples/magic-actions (proven on devnet ER):
-// the action writes a SEPARATE non-delegated account and only READS the committed order,
-// which is the pattern that actually runs.
+// KEEPER-BRIDGE model (devnet ER watches/triggers, off-chain keeper fills on FlashTrade mainnet):
+//   create_order (+ Fill receipt)  ->  delegate to ER  ->  check (crank) ->
+//   on trigger: commit + Magic Action `mark_triggered` stamps Fill = Triggered (the fire signal) ->
+//   [off-chain keeper opens the position on FlashTrade mainnet with the session key + builder code] ->
+//   keeper calls `confirm_fill` -> Fill = Settled, with the mainnet tx signature anchored on-chain.
 //
-// QUEUED: step 3 privacy (ephemeral permission on the ER), real FlashTrade CPI in settle.
+// The chain therefore proves the trigger fired BEFORE the fill, and anchors the fill's mainnet
+// signature back — that's the trustless-ish + receipts (#8) story.
 
 use anchor_lang::prelude::*;
 use ephemeral_rollups_sdk::anchor::{action, commit, delegate, ephemeral};
@@ -14,7 +15,7 @@ use ephemeral_rollups_sdk::cpi::DelegateConfig;
 use ephemeral_rollups_sdk::ephem::{CallHandler, MagicIntentBundleBuilder};
 use ephemeral_rollups_sdk::{ActionArgs, ShortAccountMeta};
 
-declare_id!("JXiSmxyKzXaiCQ28WawpQ3RBmCPuw3Gvvfzg4VTKyML"); // `anchor keys sync` sets this
+declare_id!("JXiSmxyKzXaiCQ28WawpQ3RBmCPuw3Gvvfzg4VTKyML");
 
 pub const ORDER_SEED: &[u8] = b"order";
 pub const FILL_SEED: &[u8] = b"fill";
@@ -24,9 +25,9 @@ pub const FILL_SEED: &[u8] = b"fill";
 pub mod kestrel {
     use super::*;
 
-    /// Arm an order on the base layer + create its Fill receipt (stays on base layer).
-    pub fn create_order(ctx: Context<CreateOrder>, params: OrderParams) -> Result<()> {
+    pub fn create_order(ctx: Context<CreateOrder>, id: u64, params: OrderParams) -> Result<()> {
         let order = &mut ctx.accounts.order;
+        order.id = id;
         order.owner = ctx.accounts.owner.key();
         order.session_authority = params.session_authority;
         order.market = params.market;
@@ -40,20 +41,24 @@ pub mod kestrel {
 
         let fill = &mut ctx.accounts.fill;
         fill.order = order.key();
-        fill.status = OrderStatus::Armed as u8;
+        fill.session_authority = params.session_authority; // who may confirm the mainnet fill
+        fill.keeper = Pubkey::default();
         fill.fired_price = 0;
+        fill.entry_price = 0;
         fill.slot = 0;
+        fill.status = OrderStatus::Armed as u8;
+        fill.sig = [0u8; 64];
         msg!("Kestrel: order armed for {}", order.owner);
         Ok(())
     }
 
-    /// Delegate the order PDA to the ER.
-    pub fn delegate_order(ctx: Context<DelegateOrder>) -> Result<()> {
+    pub fn delegate_order(ctx: Context<DelegateOrder>, id: u64) -> Result<()> {
         if ctx.accounts.order.owner != &ephemeral_rollups_sdk::id() {
             let validator = ctx.accounts.validator.as_ref();
+            let id_bytes = id.to_le_bytes();
             ctx.accounts.delegate_order(
                 &ctx.accounts.owner,
-                &[ORDER_SEED, ctx.accounts.owner.key().as_ref()],
+                &[ORDER_SEED, ctx.accounts.owner.key().as_ref(), &id_bytes],
                 DelegateConfig {
                     validator: validator.map(|v| v.key()),
                     ..Default::default()
@@ -65,7 +70,7 @@ pub mod kestrel {
         Ok(())
     }
 
-    /// CRANK — runs on the ER, called each tick by the keeper. Keeper passes the price (step 1).
+    /// CRANK — runs on the ER. Keeper passes the price (step 1; on-chain oracle read is step 2).
     pub fn check(ctx: Context<Check>, price: u64) -> Result<()> {
         let order = &mut ctx.accounts.order;
         if order.status != OrderStatus::Armed as u8 {
@@ -81,20 +86,13 @@ pub mod kestrel {
         order.status = OrderStatus::Triggered as u8;
         order.exit(&crate::ID)?;
 
-        // Post-commit Magic Action: writes the Fill receipt on the base layer.
-        let ix_data =
-            anchor_lang::InstructionData::data(&crate::instruction::SettleOnFlashtrade { price });
+        // Post-commit Magic Action: stamp the Fill receipt = Triggered (the keeper's fire signal).
+        let ix_data = anchor_lang::InstructionData::data(&crate::instruction::MarkTriggered { price });
         let action = CallHandler {
             destination_program: crate::ID,
             accounts: vec![
-                ShortAccountMeta {
-                    pubkey: ctx.accounts.fill.key().to_bytes().into(),
-                    is_writable: true,
-                },
-                ShortAccountMeta {
-                    pubkey: ctx.accounts.order.key().to_bytes().into(),
-                    is_writable: false,
-                },
+                ShortAccountMeta { pubkey: ctx.accounts.fill.key().to_bytes().into(), is_writable: true },
+                ShortAccountMeta { pubkey: ctx.accounts.order.key().to_bytes().into(), is_writable: false },
             ],
             args: ActionArgs::new(ix_data),
             escrow_authority: ctx.accounts.payer.to_account_info(),
@@ -109,23 +107,34 @@ pub mod kestrel {
         .commit(&[ctx.accounts.order.to_account_info()])
         .add_post_commit_actions([action])
         .build_and_invoke()?;
-        msg!("Kestrel: triggered at {} — settling on base layer", price);
+        msg!("Kestrel: triggered at {} — keeper to fill on FlashTrade mainnet", price);
         Ok(())
     }
 
-    /// Magic Action target — runs on the base layer after the commit. Writes the receipt.
-    /// TODO(validate): add the FlashTrade openPosition/closePosition CPI here, signed by
-    /// order.session_authority, with the partner builder code set.
-    pub fn settle_on_flashtrade(ctx: Context<SettleOnFlashtrade>, price: u64) -> Result<()> {
+    /// Magic Action target (base layer): stamp Fill = Triggered with the fired price.
+    pub fn mark_triggered(ctx: Context<MarkTriggered>, price: u64) -> Result<()> {
         let fill = &mut ctx.accounts.fill;
-        fill.status = OrderStatus::Settled as u8;
+        fill.status = OrderStatus::Triggered as u8;
         fill.fired_price = price;
         fill.slot = Clock::get()?.slot;
-        msg!("Kestrel: order settled on FlashTrade (stub) at {}", price);
+        msg!("Kestrel: fire signal — triggered at {}", price);
         Ok(())
     }
 
-    /// Cancel/cleanup: commit + undelegate the order.
+    /// Called by the keeper AFTER it opens the position on FlashTrade mainnet.
+    /// Stamps Fill = Settled and anchors the mainnet tx signature + entry price on-chain.
+    pub fn confirm_fill(ctx: Context<ConfirmFill>, entry_price: u64, sig: [u8; 64]) -> Result<()> {
+        let fill = &mut ctx.accounts.fill;
+        require!(fill.status == OrderStatus::Triggered as u8, KestrelError::NotTriggered);
+        fill.status = OrderStatus::Settled as u8;
+        fill.entry_price = entry_price;
+        fill.sig = sig;
+        fill.keeper = ctx.accounts.keeper.key();
+        fill.slot = Clock::get()?.slot;
+        msg!("Kestrel: fill confirmed on FlashTrade mainnet at entry {}", entry_price);
+        Ok(())
+    }
+
     pub fn cancel_order(ctx: Context<CancelOrder>) -> Result<()> {
         MagicIntentBundleBuilder::new(
             ctx.accounts.payer.to_account_info(),
@@ -148,8 +157,15 @@ fn is_triggered(order: &Order, price: u64) -> bool {
     }
 }
 
+#[error_code]
+pub enum KestrelError {
+    #[msg("Fill is not in the Triggered state")]
+    NotTriggered,
+}
+
 #[account]
 pub struct Order {
+    pub id: u64,
     pub owner: Pubkey,
     pub session_authority: Pubkey,
     pub market: Pubkey,
@@ -165,9 +181,13 @@ pub struct Order {
 #[account]
 pub struct Fill {
     pub order: Pubkey,
+    pub session_authority: Pubkey,
+    pub keeper: Pubkey,
     pub fired_price: u64,
+    pub entry_price: u64,
     pub slot: u64,
     pub status: u8,
+    pub sig: [u8; 64], // FlashTrade mainnet tx signature (raw bytes)
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -212,12 +232,13 @@ impl TryFrom<u8> for OrderKind {
 }
 
 #[derive(Accounts)]
+#[instruction(id: u64)]
 pub struct CreateOrder<'info> {
     #[account(
         init_if_needed,
         payer = owner,
         space = 8 + core::mem::size_of::<Order>(),
-        seeds = [ORDER_SEED, owner.key().as_ref()],
+        seeds = [ORDER_SEED, owner.key().as_ref(), &id.to_le_bytes()],
         bump
     )]
     pub order: Account<'info, Order>,
@@ -236,10 +257,11 @@ pub struct CreateOrder<'info> {
 
 #[delegate]
 #[derive(Accounts)]
+#[instruction(id: u64)]
 pub struct DelegateOrder<'info> {
     pub owner: Signer<'info>,
     /// CHECK: the order PDA to delegate
-    #[account(mut, del, seeds = [ORDER_SEED, owner.key().as_ref()], bump)]
+    #[account(mut, del, seeds = [ORDER_SEED, owner.key().as_ref(), &id.to_le_bytes()], bump)]
     pub order: UncheckedAccount<'info>,
     /// CHECK: checked by the delegate program
     pub validator: Option<UncheckedAccount<'info>>,
@@ -250,7 +272,7 @@ pub struct DelegateOrder<'info> {
 pub struct Check<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
-    #[account(mut, seeds = [ORDER_SEED, order.owner.as_ref()], bump)]
+    #[account(mut, seeds = [ORDER_SEED, order.owner.as_ref(), &order.id.to_le_bytes()], bump)]
     pub order: Account<'info, Order>,
     /// CHECK: Fill receipt PDA (base layer) — written by the action
     #[account(seeds = [FILL_SEED, order.key().as_ref()], bump)]
@@ -261,11 +283,24 @@ pub struct Check<'info> {
 
 #[action]
 #[derive(Accounts)]
-pub struct SettleOnFlashtrade<'info> {
+pub struct MarkTriggered<'info> {
     #[account(mut, seeds = [FILL_SEED, order.key().as_ref()], bump)]
     pub fill: Account<'info, Fill>,
     /// CHECK: the order (delegated) — read only
     pub order: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ConfirmFill<'info> {
+    #[account(mut)]
+    pub keeper: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [FILL_SEED, fill.order.as_ref()],
+        bump,
+        constraint = fill.session_authority == keeper.key() @ KestrelError::NotTriggered
+    )]
+    pub fill: Account<'info, Fill>,
 }
 
 #[commit]
