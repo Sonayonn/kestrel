@@ -14,6 +14,15 @@ use ephemeral_rollups_sdk::anchor::{action, commit, delegate, ephemeral};
 use ephemeral_rollups_sdk::cpi::DelegateConfig;
 use ephemeral_rollups_sdk::ephem::{CallHandler, MagicIntentBundleBuilder};
 use ephemeral_rollups_sdk::{ActionArgs, ShortAccountMeta};
+use anchor_lang::system_program::{transfer, Transfer};
+use ephemeral_rollups_sdk::access_control::instructions::{
+    CloseEphemeralPermissionCpi, CreateEphemeralPermissionCpi, UpdateEphemeralPermissionCpi,
+};
+use ephemeral_rollups_sdk::access_control::structs::{
+    EphemeralMembersArgs, EphemeralPermission, Member, PERMISSION_SEED, TX_BALANCES_FLAG,
+    TX_LOGS_FLAG, TX_MESSAGE_FLAG,
+};
+use ephemeral_rollups_sdk::consts::{EPHEMERAL_VAULT_ID, MAGIC_PROGRAM_ID, PERMISSION_PROGRAM_ID};
 
 declare_id!("JXiSmxyKzXaiCQ28WawpQ3RBmCPuw3Gvvfzg4VTKyML");
 
@@ -26,6 +35,17 @@ pub mod kestrel {
     use super::*;
 
     pub fn create_order(ctx: Context<CreateOrder>, id: u64, params: OrderParams) -> Result<()> {
+        // Pre-fund the order PDA with rent for the ephemeral permission created later on the ER.
+        transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.key(),
+                Transfer {
+                    from: ctx.accounts.owner.to_account_info(),
+                    to: ctx.accounts.order.to_account_info(),
+                },
+            ),
+            ephemeral_rollups_sdk::ephemeral_accounts::rent(EphemeralPermission::size_of(1) as u32),
+        )?;
         let order = &mut ctx.accounts.order;
         order.id = id;
         order.owner = ctx.accounts.owner.key();
@@ -143,6 +163,73 @@ pub mod kestrel {
         )
         .commit_and_undelegate(&[ctx.accounts.order.to_account_info()])
         .build_and_invoke()?;
+        Ok(())
+    }
+
+    /// Create the ephemeral permission on the ER (starts public). Payer = the order PDA.
+    pub fn init_permission(ctx: Context<PermissionContext>) -> Result<()> {
+        if ctx.accounts.permission.lamports() > 0 {
+            msg!("Permission already exists");
+            return Ok(());
+        }
+        let id_bytes = ctx.accounts.order.id.to_le_bytes();
+        let signers = [ORDER_SEED, ctx.accounts.order.owner.as_ref(), &id_bytes, &[ctx.bumps.order]];
+        CreateEphemeralPermissionCpi {
+            payer: ctx.accounts.order.to_account_info(),
+            permissioned_account: ctx.accounts.order.to_account_info(),
+            permission: ctx.accounts.permission.to_account_info(),
+            vault: ctx.accounts.ephemeral_vault.to_account_info(),
+            magic_program: ctx.accounts.magic_program.to_account_info(),
+            permission_program: ctx.accounts.permission_program.to_account_info(),
+            args: EphemeralMembersArgs { is_private: false, members: vec![] },
+        }
+        .invoke_signed(&[&signers])?;
+        Ok(())
+    }
+
+    /// Flip privacy. When private, only the order owner can read the order's ER state
+    /// (price, size, direction) via the TEE — hidden from front-runners until it fires.
+    pub fn set_privacy(ctx: Context<PermissionContext>, is_private: bool) -> Result<()> {
+        let id_bytes = ctx.accounts.order.id.to_le_bytes();
+        let signers = [ORDER_SEED, ctx.accounts.order.owner.as_ref(), &id_bytes, &[ctx.bumps.order]];
+        let members = if is_private {
+            vec![Member {
+                flags: TX_LOGS_FLAG | TX_MESSAGE_FLAG | TX_BALANCES_FLAG,
+                pubkey: ctx.accounts.order.owner,
+            }]
+        } else {
+            vec![]
+        };
+        UpdateEphemeralPermissionCpi {
+            payer: ctx.accounts.order.to_account_info(),
+            permissioned_account: ctx.accounts.order.to_account_info(),
+            permission: ctx.accounts.permission.to_account_info(),
+            vault: ctx.accounts.ephemeral_vault.to_account_info(),
+            magic_program: ctx.accounts.magic_program.to_account_info(),
+            permission_program: ctx.accounts.permission_program.to_account_info(),
+            authority: ctx.accounts.order.to_account_info(),
+            authority_is_signer: false,
+            args: EphemeralMembersArgs { is_private, members },
+        }
+        .invoke_signed(&[&signers])?;
+        msg!("Kestrel: order privacy = {}", is_private);
+        Ok(())
+    }
+
+    pub fn close_permission(ctx: Context<PermissionContext>) -> Result<()> {
+        let id_bytes = ctx.accounts.order.id.to_le_bytes();
+        let signers = [ORDER_SEED, ctx.accounts.order.owner.as_ref(), &id_bytes, &[ctx.bumps.order]];
+        CloseEphemeralPermissionCpi {
+            payer: ctx.accounts.order.to_account_info(),
+            permissioned_account: ctx.accounts.order.to_account_info(),
+            permission: ctx.accounts.permission.to_account_info(),
+            vault: ctx.accounts.ephemeral_vault.to_account_info(),
+            magic_program: ctx.accounts.magic_program.to_account_info(),
+            permission_program: ctx.accounts.permission_program.to_account_info(),
+            authority: ctx.accounts.order.to_account_info(),
+            authority_is_signer: false,
+        }
+        .invoke_signed(&[&signers])?;
         Ok(())
     }
 }
@@ -310,4 +397,31 @@ pub struct CancelOrder<'info> {
     pub payer: Signer<'info>,
     #[account(mut, seeds = [ORDER_SEED, order.owner.as_ref()], bump)]
     pub order: Account<'info, Order>,
+}
+
+/// Shared context for init_permission / set_privacy / close_permission (all run on the ER).
+#[derive(Accounts)]
+pub struct PermissionContext<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [ORDER_SEED, order.owner.as_ref(), &order.id.to_le_bytes()],
+        has_one = owner,
+        bump
+    )]
+    pub order: Account<'info, Order>,
+    /// CHECK: ephemeral permission for the order, verified by the permission program
+    #[account(mut, seeds = [PERMISSION_SEED, order.key().as_ref()], bump,
+              seeds::program = PERMISSION_PROGRAM_ID)]
+    pub permission: UncheckedAccount<'info>,
+    /// CHECK: Permission Program
+    #[account(address = PERMISSION_PROGRAM_ID)]
+    pub permission_program: UncheckedAccount<'info>,
+    /// CHECK: ephemeral vault
+    #[account(mut, address = EPHEMERAL_VAULT_ID)]
+    pub ephemeral_vault: UncheckedAccount<'info>,
+    /// CHECK: Magic Program
+    #[account(address = MAGIC_PROGRAM_ID)]
+    pub magic_program: UncheckedAccount<'info>,
 }

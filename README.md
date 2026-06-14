@@ -1,78 +1,98 @@
 # Kestrel
 
-Trustless, private conditional-order execution for Solana perps.
+**Private, programmable conditional orders for Solana perps.** Arm a stop-loss, take-profit, trailing stop or bracket — Kestrel watches the market and fires it the instant your price hits. On-chain, non-custodial, and invisible until it executes.
 
-Arm a stop-loss / trailing stop / bracket order. It is watched in real time inside a
-MagicBlock **Private Ephemeral Rollup** (invisible to front-runners until it fires), and
-settled on **FlashTrade** the instant the trigger hits — non-custodial, sub-second, gasless
-to watch. Exposed as a one-call SDK any Solana trading app can build on.
+- **Live app:** _(your deployed URL)_ · **Docs:** `/docs.html`
+- **Program (devnet):** `JXiSmxyKzXaiCQ28WawpQ3RBmCPuw3Gvvfzg4VTKyML`
+- **Demo:** _(your video link)_
 
-## How it uses MagicBlock (each piece load-bearing)
-- **Ephemeral Rollup** — the always-on watcher. The watch loop is impossible/too expensive on mainnet.
-- **Private ER (TEE)** — order price + size hidden (owner-only) until execution. Anti-snipe.
-- **Pricing Oracle** — Pyth Lazer pushed into the rollup every 50–200ms = our trigger heartbeat.
-- **Magic Actions** — `add_post_commit_actions` fires the FlashTrade settle on mainnet right after commit.
-- **FlashTrade** (partner) — the venue. Settle via openPosition/closePosition with the partner builder code (rebate).
+Built for the MagicBlock × FlashTrade hackathon.
 
-## Build plan — 5 pillars (the 30 feature ideas collapse into these)
+---
 
-The crank evaluating a condition tree is the core primitive; most "features" are just
-condition types or observability on the same pipeline. Build the pillar, the behaviors fall out.
+## The problem
 
-**Pillar A — Condition engine.** The ER crank evaluates an AND/OR condition tree each tick.
-Delivers: stop-loss, take-profit, trailing stop (#3), multi-condition AND/OR (#6),
-funding-rate trigger (#22), max-drawdown circuit breaker (#23), expiry + auto-undelegate (#14).
+On-chain conditional orders are broken in three ways. They're **public** — your stop-loss trigger sits in plain view, so MEV bots can see it coming and hunt it. They're **rigid** — a venue natively offers only simple, exit-only triggers, not the entries, trailing, brackets and multi-condition logic traders actually want. And they're **hard to automate trustlessly** — watching a price every tick is impossible on mainnet (gas, latency), so today you either trust a centralized exchange's servers or run a bot that dies the moment your machine does.
 
-**Pillar B — Order groups.** Linked orders with cancel-surviving-leg.
-Delivers: bracket / OCO (#2), light if-then chaining (#12).
+## The idea
 
-**Pillar C — Privacy (TEE).** Ephemeral permission, owner-only read.
-Delivers: private order book (#1) — wraps every order. The centerpiece.
+Kestrel is a layer *above* a perp venue, not a replacement for it. Each order is delegated into a **MagicBlock Ephemeral Rollup**, where a crank evaluates its condition every tick — sub-50ms, gasless — an always-on watch loop that's impossible on mainnet. Orders run inside a **Private Rollup (TEE)**, so the trigger price, size and direction stay sealed in the enclave until the order fires, which kills the stop-hunting that plagues public orders. When a trigger hits, a post-commit **Magic Action** stamps a tamper-proof receipt on-chain, and a keeper settles the position on **FlashTrade**, anchoring the execution back on-chain.
 
-**Pillar D — Settlement + observability.** Magic Action → FlashTrade fill, instrumented.
-Delivers: live fill, slippage guardrail / auto-abort (#13), referral hook (#15),
-on-chain execution receipts (#8), live latency SLA (#30), Telegram fill notify (#18).
+> Watched in a rollup, hidden in a TEE, settled on a real venue — exposed as one SDK call.
 
-**Pillar E — SDK + dashboard.** The layer surface + a live UI.
-Delivers: one-call SDK (#5), gasless order amendment (#28), live P&L dashboard (#7),
-multi-asset portfolio view (#10).
+The Ephemeral Rollup isn't an add-on here; it's the engine. The whole product depends on a private, continuous watch loop only an ER can provide.
 
-### Sequencing (each tier ships on a green spine)
-- **T0 spine (in progress):** create_order → delegate → check → Magic Action → live FlashTrade fill.
-- **T1 must-ship:** Pillar C privacy, Pillar B bracket, Pillar A (SL/TP/trailing), Pillar D (fill + receipts + latency + notify + referral + guardrail), Pillar E SDK.
-- **T2 if spine green by end of Day 2:** Pillar A extensions (#6 multi-condition, #22 funding, #23 drawdown), Pillar E dashboard (#7, #10), amendment (#28).
+## How it works
 
-## Status (tick as we go)
-- [x] Toolchain validated (solana 3.1.9, anchor-cli 0.32.1, node 22)
-- [x] Reference `magic-actions` builds + deploys to MagicBlock devnet ER (id FkDA…GZE)
-- [ ] ER round-trip test runs (install ts-mocha deps, re-run)  ← we are here
-- [x] Kestrel spine `lib.rs` written against ephemeral-rollups-sdk 0.14.3
-- [ ] `kestrel-app` workspace builds (`anchor build` green)
-- [ ] Spine on ER: create_order → delegate → check → Magic Action settle
-- [ ] FlashTrade settle wired into `settle_on_flashtrade` (needs the signing answer)
-- [ ] T1: privacy (C), bracket (B), SL/TP/trailing (A), receipts+latency+notify+referral+guardrail (D), SDK (E)
-- [ ] T2: multi-condition / funding / drawdown (A), dashboard (E), amendment
+```
+arm ─▶ delegate to ER (TEE) ─▶ crank fires on trigger ─▶ Magic Action: on-chain receipt
+                                                                   │
+                                            keeper settles on FlashTrade ─▶ confirm_fill
+                                                                   │
+                                              Armed ─▶ Triggered ─▶ Settled (entry anchored)
+```
 
-## Roadmap (deliberately out of scope for the 48h build — the "what's next" narrative)
-Vault / shared strategy pool (#29), permissionless keeper incentive network (#17),
-on-chain backtesting (#26), ER health-monitor + multi-region failover (#20),
-cross-asset hedge trigger (#16), iceberg orders (#11), strategy template marketplace (#19),
-social M-of-N stop-loss (#25), order fingerprinting (#24), volatility-adaptive sizing (#21),
-liquidation-defense partial close (#27 — pull forward first if FlashTrade exposes position health cheaply),
-sponsored gasless onboarding (#9).
+The lifecycle is fully auditable on-chain: a `Fill` receipt moves Armed → Triggered → Settled, carrying the fired price and the settled entry price.
 
-## Two blocking questions (must be answered before settlement code)
-- **FlashTrade:** can a PDA / pre-authorized session key sign open/close for a user's position
-  (delegated trading authority via Privilege / NFT trading account)? This decides if the live fill is real.
-- **MagicBlock:** do post-commit Magic Actions work from the **TEE** (PER) validator, not just plain ERs?
-  If not, fallback: commit a `triggered` flag to mainnet and let the keeper submit the FlashTrade tx.
+## What's live
 
-## Reference implementations we fork
-- `magicblock-labs/magicblock-engine-examples` — anchor-counter (public + private), magic-actions
-- `magicblock-labs/real-time-pricing-oracle` — chain pusher + example price consumer
-- `flash-trade/flash-trade-sdk` — examples/src/trade.ts (openPosition / closePosition)
+- **The full private pipeline on devnet** — arm → delegate → private crank fires → on-chain receipt → settlement. Reproducible end to end.
+- **Privacy proven (TEE):** the owner can read their order; a stranger is blocked. (5/5, `tests/kestrel-privacy.ts`.)
+- **Keeper-bridge proven:** trigger → Triggered → `confirm_fill` → Settled, mainnet signature slot anchored. (`tests/kestrel.ts`.)
+- **FlashTrade integration live-verified:** the keeper calls FlashTrade's mainnet API on every trigger, pulls a real executable quote, and anchors the real entry price on-chain.
+- **Live console:** drives the whole lifecycle — arm, delegate, fire, settle — from the browser, signed by your wallet, with each order streaming Armed → Triggered → Settled. Plus a one-call SDK and an SDK reference.
 
-## Toolchain
-Clone anchor-counter first and match its lockfile versions exactly (doc version tables disagree).
-Install the MagicBlock dev skill for AI-assisted coding:
-`npx add-skill https://github.com/magicblock-labs/magicblock-dev-skill`
+**Honest note on the fill.** The integration runs end-to-end against real FlashTrade infrastructure; the one step withheld in the demo is signing the *funded* position, which needs real collateral we didn't wire in. `PREVIEW=0` with a funded basket executes that final step — the wiring is real and proven, minus the funded signature. No real-money position was opened in the demo.
+
+## Why two clusters (devnet + mainnet)
+
+The watch loop runs on devnet, where the MagicBlock ER and TEE were developed; FlashTrade settlement is on mainnet, where its liquidity and price feeds live (devnet FlashTrade has no working oracle). The keeper bridges them. **In production Kestrel deploys on a mainnet ER and collapses to a single cluster** — the split is a development convenience, not part of the design.
+
+## Quickstart
+
+```bash
+# program
+anchor build && anchor deploy            # deploys to the MagicBlock devnet endpoint
+
+# tests (proof)
+anchor test --skip-build --skip-deploy   # keeper-bridge spine
+ANCHOR_PROVIDER_URL=https://devnet-tee.magicblock.app ANCHOR_WALLET=~/.config/solana/id.json \
+  yarn ts-mocha -p ./tsconfig.json -t 120000 tests/kestrel-privacy.ts   # TEE privacy
+
+# app (static; also deployable on Vercel)
+cd site && npx serve .
+
+# keeper (preview — live FlashTrade quotes, no funds)
+KEEPER_KEYPAIR=~/.config/solana/id.json bun run keeper-v2.ts
+```
+
+## SDK
+
+```ts
+import { KestrelClient } from "@kestrel/sdk";
+
+const k = new KestrelClient({ connection, wallet, programId, idl });
+
+const { id } = await k.arm({
+  kind: "stop_loss", side: "close",
+  triggerPrice: 140, referencePrice: 150, size: 11_000_000, private: true,
+});
+
+k.watchFills(f => console.log(f.status, f.entryPrice));
+```
+
+Full reference on the **Docs** page (`/docs.html`).
+
+## Architecture notes
+
+- **Order** and **Fill** are id-keyed PDAs (multi-order per wallet). `Fill` is the lifecycle source of truth.
+- **Privacy** uses MagicBlock ephemeral permissions: `init_permission` → `set_privacy(true)` on the TEE validator; reads are gated by an auth token.
+- **Settlement** is a keeper-bridge: the on-chain program never holds funds; the keeper opens the FlashTrade position with a scoped session key and calls `confirm_fill` to anchor the result.
+
+## Built with
+
+Solana · Anchor · MagicBlock Ephemeral Rollups + Private Rollups (TEE) · FlashTrade.
+
+## License
+
+MIT.

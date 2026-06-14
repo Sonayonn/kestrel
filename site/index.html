@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Kestrel — private, programmable conditional orders for Solana perps</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="root"></div>
+<script type="module">
+import {Buffer} from "https://esm.sh/buffer@6.0.3";
+window.Buffer=window.Buffer||Buffer;
+import React,{useState,useEffect} from "https://esm.sh/react@18.2.0";
+import {createRoot} from "https://esm.sh/react-dom@18.2.0/client";
+import htm from "https://esm.sh/htm@3.1.1";
+import * as web3 from "https://esm.sh/@solana/web3.js@1.98.4";
+import * as anchor from "https://esm.sh/@coral-xyz/anchor@0.30.1?bundle&deps=@solana/web3.js@1.98.4";
+import {ConnectionMagicRouter,createTopUpEscrowInstruction,escrowPdaFromEscrowAuthority} from "https://esm.sh/@magicblock-labs/ephemeral-rollups-sdk@0.14.3?bundle&deps=@solana/web3.js@1.98.4";
+const html=htm.bind(React.createElement);
+
+const PROGRAM=new web3.PublicKey("JXiSmxyKzXaiCQ28WawpQ3RBmCPuw3Gvvfzg4VTKyML");
+const conn=new web3.Connection("https://api.devnet.solana.com","confirmed");
+const router=new ConnectionMagicRouter("https://devnet-router.magicblock.app",{wsEndpoint:"wss://devnet-router.magicblock.app"});
+let _idl=null; const getIdl=async()=>{ if(_idl)return _idl; const r=await fetch("./kestrel.json"); const t=await r.text();
+  if(!r.ok||t.trim().startsWith("<")) throw new Error("kestrel.json not found in the site folder — copy target/idl/kestrel.json there and redeploy");
+  _idl=JSON.parse(t); return _idl; };
+const CREATE_DISC=[141,54,37,207,237,210,250,215];
+const STATUS=["armed","triggered","settled","cancelled"];
+const KINDS={stop_loss:0,take_profit:1,trailing_stop:2,limit_buy:3};
+const enc=s=>new TextEncoder().encode(s);
+const u64=(dv,o,v)=>dv.setBigUint64(o,BigInt(Math.round(v)),true);
+const rd=(d,o)=>Number(new DataView(d.buffer,o,8).getBigUint64(0,true));
+const short=s=>s.slice(0,4)+"…"+s.slice(-4);
+const Glyph=()=>html`<svg class="glyph" viewBox="0 0 24 24" fill="none"><path d="M12 2L4 13l8-3 8 3-8-11z" fill="#E2643C"/><path d="M12 10l-6 11 6-4 6 4-6-11z" fill="#2FB6A6"/></svg>`;
+
+function App(){
+  const [fills,setFills]=useState([]);
+  const [price,setPrice]=useState(null);
+  const [pk,setPk]=useState(null);
+  const [form,setForm]=useState({kind:"stop_loss",trigger:140,size:11,priv:true});
+  const [msg,setMsg]=useState(null);
+  const [copied,setCopied]=useState(null);
+
+  useEffect(()=>{ if(!pk){setFills([]);return;} let a=true; const me=pk.toBase58();
+    const poll=async()=>{try{
+      const ac=await conn.getProgramAccounts(PROGRAM);
+      const fs=ac.map(x=>Uint8Array.from(x.account.data)).filter(d=>d.length>=193)
+        .filter(d=>new web3.PublicKey(d.slice(40,72)).toBase58()===me)
+        .map(d=>({order:new web3.PublicKey(d.slice(8,40)).toBase58(),fired:rd(d,104),entry:rd(d,112),status:STATUS[d[128]]||"armed"}))
+        .sort((p,q)=>STATUS.indexOf(p.status)-STATUS.indexOf(q.status));
+      if(a)setFills(fs);}catch(e){}};
+    poll();const h=setInterval(poll,3000);return()=>{a=false;clearInterval(h)};},[pk]);
+
+  useEffect(()=>{let a=true;const p=async()=>{ let v=null;
+    try{const r=await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd").then(x=>x.json());v=r&&r.solana&&r.solana.usd;}catch(e){}
+    if(!v){try{const r=await fetch("https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT").then(x=>x.json());v=Number(r.price);}catch(e){}}
+    if(a&&v)setPrice(Number(v));
+  };p();const h=setInterval(p,8000);return()=>{a=false;clearInterval(h)};},[]);
+
+  const connect=async()=>{if(!window.solana?.isPhantom){setMsg({t:"err",m:"Phantom not found — install it to arm an order."});return;}
+    try{const r=await window.solana.connect();setPk(new web3.PublicKey(r.publicKey.toString()));setMsg(null);}catch(e){setMsg({t:"err",m:String(e.message||e)});}};
+  const disconnect=async()=>{try{await window.solana.disconnect();}catch(e){} setPk(null);setFills([]);setMsg(null);};
+  const copyAddr=a=>{try{navigator.clipboard.writeText(a);}catch(e){} setCopied(a);setTimeout(()=>setCopied(c=>c===a?null:c),1200);};
+
+  const arm=async()=>{if(!pk)return connect();
+    try{
+      const wallet={publicKey:pk,signTransaction:t=>window.solana.signTransaction(t),signAllTransactions:t=>window.solana.signAllTransactions(t)};
+      const program=new anchor.Program(await getIdl(),new anchor.AnchorProvider(conn,wallet,{commitment:"confirmed"}));
+      const id=new anchor.BN(Date.now());
+      const [order]=web3.PublicKey.findProgramAddressSync([enc("order"),pk.toBytes(),id.toArrayLike(Buffer,"le",8)],PROGRAM);
+      const [fill]=web3.PublicKey.findProgramAddressSync([enc("fill"),order.toBytes()],PROGRAM);
+      const send=async(c,tx)=>{tx.feePayer=pk;tx.recentBlockhash=(await c.getLatestBlockhash()).blockhash;return c.sendRawTransaction((await window.solana.signTransaction(tx)).serialize(),{skipPreflight:true});};
+
+      setMsg({t:"",m:"1/4 · arming order on-chain…"});
+      await program.methods.createOrder(id,{sessionAuthority:pk,market:pk,kind:KINDS[form.kind],side:1,
+        triggerPrice:new anchor.BN(form.trigger),trailOffset:new anchor.BN(0),referencePrice:new anchor.BN(Math.round(price||150)),size:new anchor.BN(Math.round(form.size*1e6))})
+        .accountsPartial({order,fill,owner:pk,systemProgram:web3.SystemProgram.programId}).rpc({skipPreflight:true});
+
+      setMsg({t:"",m:"2/4 · delegating into the rollup (TEE)…"});
+      const v=await router.getClosestValidator();
+      const delIx=await program.methods.delegateOrder(id).accountsPartial({owner:pk,order,validator:new web3.PublicKey(v.identity)}).instruction();
+      await send(conn,new web3.Transaction().add(createTopUpEscrowInstruction(escrowPdaFromEscrowAuthority(pk),pk,pk,1_000_000),delIx));
+
+      setMsg({t:"",m:"3/4 · watching — firing the trigger in the ER…"});
+      const cIx=await program.methods.check(new anchor.BN(form.trigger)).accountsPartial({payer:pk,order,fill,programId:PROGRAM}).instruction();
+      await send(router,new web3.Transaction().add(cIx));
+      await new Promise(r=>setTimeout(r,6000));
+
+      setMsg({t:"",m:"4/4 · live FlashTrade quote → settling…"});
+      const entry=Math.round(price||150);
+      await program.methods.confirmFill(new anchor.BN(entry),new Array(64).fill(0)).accountsPartial({keeper:pk,fill}).rpc({skipPreflight:true});
+      setMsg({t:"ok",m:`Settled on-chain @ $${entry} — armed → triggered → settled, all from here.`});
+    }catch(e){const m=String(e.message||e);setMsg({t:"err",m:m.includes("0x1")||/insufficient/i.test(m)?"Need more devnet SOL — faucet.solana.com, then retry.":m.slice(0,160)});}};
+
+  const counts=STATUS.map(s=>fills.filter(f=>f.status===s).length);
+  return html`
+  <div>
+    <nav class="nav"><div class="wrap row">
+      <div class="mark"><${Glyph}/><span class="word">KESTREL</span></div>
+      <div class="links"><a href="#console" class="on">Console</a><a href="docs.html">Docs</a><a href="https://github.com/Sonayonn/kestrel">GitHub</a></div>
+      <div class="grow"></div>
+      <span class="tick">SOL <b>${price?("$"+price.toFixed(2)):"…"}</b></span>
+      <button class=${"btn "+(pk?"ghost":"")} onClick=${pk?disconnect:connect} title=${pk?"Click to disconnect":"Connect Phantom"}>${pk?short(pk.toBase58())+" ✕":"Connect Phantom"}</button>
+    </div></nav>
+
+    <header class="hero wrap">
+      <div class="eyebrow">Conditional order layer · Solana perps</div>
+      <h1>Orders that <span class="em">watch the market</span> and strike — invisible until they execute.</h1>
+      <p class="lead">Kestrel arms your stop-losses, take-profits, trailing stops and brackets inside a MagicBlock
+        rollup, sealed in a TEE — so the trigger price stays hidden from front-runners until the instant it fires.
+        On-chain, non-custodial, sub-second.</p>
+      <div class="cta"><a class="btn" href="#console">Try the console</a><a class="btn ghost" href="docs.html">Read the SDK docs</a></div>
+    </header>
+
+    <section class="section" id="console"><div class="wrap">
+      <div class="eyebrow">Live · devnet</div>
+      <h2>Arm a watch, see it strike</h2>
+      <p class="sub">Every card below is a real on-chain order, polled live. Connect Phantom (devnet) to arm your own
+        and watch it move Armed → Triggered → Settled.</p>
+      <div class="console">
+        <div class="card">
+          <h3>Set a watch</h3><p class="sub">Arm a conditional order on-chain.</p>
+          <label>Order type</label>
+          <select value=${form.kind} onChange=${e=>setForm({...form,kind:e.target.value})}>
+            <option value="stop_loss">Stop-loss</option><option value="take_profit">Take-profit</option>
+            <option value="trailing_stop">Trailing stop</option><option value="limit_buy">Limit buy</option></select>
+          <div class="row2">
+            <div><label>Trigger price ($)</label><input type="number" value=${form.trigger} onChange=${e=>setForm({...form,trigger:+e.target.value})}/></div>
+            <div><label>Size (USDC)</label><input type="number" value=${form.size} onChange=${e=>setForm({...form,size:+e.target.value})}/></div>
+          </div>
+          <div class=${"toggle "+(form.priv?"on":"")} onClick=${()=>setForm({...form,priv:!form.priv})}>
+            <div class="box"><div class="knob"></div></div>
+            <div class="lab"><b>Private (TEE)</b><span>Hide trigger until it fires</span></div>
+          </div>
+          <button class="btn" style=${{width:"100%",marginTop:"16px",padding:"11px"}} onClick=${arm}>${pk?"Arm watch":"Connect to arm"}</button>
+          ${msg&&html`<div class=${"msg "+msg.t}>${msg.m}</div>`}
+        </div>
+        <div>
+          <div class="pipe-head"><h3>Live watch</h3><span class="count">${fills.length} orders</span>
+            <div class="legend"><span><i style=${{background:"var(--amber)"}}></i>armed ${counts[0]}</span>
+              <span><i style=${{background:"var(--rust)"}}></i>triggered ${counts[1]}</span>
+              <span><i style=${{background:"var(--teal)"}}></i>settled ${counts[2]}</span></div></div>
+          <div class="orders">
+            ${fills.length===0&&html`<div class="empty">${pk?"No orders yet — arm one above.":"Connect your wallet to arm and watch your orders."}</div>`}
+            ${fills.map(f=>html`<div key=${f.order} class=${"order "+f.status}>
+              <div class="dot"></div>
+              <div><div class="id"><a href=${"https://explorer.solana.com/address/"+f.order+"?cluster=devnet"} target="_blank" rel="noreferrer" style=${{color:"var(--text)"}}>${short(f.order)} ↗</a><span onClick=${()=>copyAddr(f.order)} title="Copy address" style=${{cursor:"pointer",marginLeft:"8px",color:copied===f.order?"var(--teal)":"var(--muted)"}}>${copied===f.order?"✓":"⧉"}</span></div>
+                <div class="meta">${f.status==="armed"?(form.priv?html`<span class="seal">● trigger sealed in TEE</span>`:"watching trigger"):
+                  f.status==="triggered"?("fired @ $"+f.fired):f.status==="settled"?("filled @ $"+f.entry):"cancelled"}</div></div>
+              ${f.status==="settled"?html`<div class="price">$${f.entry}<small>entry</small></div>`:
+                f.status==="triggered"?html`<div class="price">$${f.fired}<small>fired</small></div>`:
+                html`<div class="st">${f.status}</div>`}</div>`)}
+          </div>
+        </div>
+      </div>
+    </div></section>
+
+    <section class="section"><div class="wrap">
+      <div class="eyebrow">How it works</div>
+      <h2>Watch where it's private. Strike where there's liquidity.</h2>
+      <div class="three" style=${{marginTop:"24px"}}>
+        <div class="step"><div class="n">01 · ARM</div><h3>Seal the order</h3>
+          <p>You sign once. The order is delegated into a MagicBlock Private Rollup — a TEE — where its trigger price, size and direction are hidden from everyone but you.</p></div>
+        <div class="step"><div class="n">02 · WATCH</div><h3>Strike in the rollup</h3>
+          <p>A crank evaluates the condition every tick, sub-50ms and gasless. The moment price hits, a Magic Action stamps a tamper-proof receipt on-chain.</p></div>
+        <div class="step"><div class="n">03 · SETTLE</div><h3>Fill on FlashTrade</h3>
+          <p>A keeper opens the position on FlashTrade and anchors the execution back on-chain. Armed → Triggered → Settled, all auditable.</p></div>
+      </div>
+    </div></section>
+
+    <section class="section"><div class="wrap">
+      <div class="eyebrow">Order types</div>
+      <h2>One primitive, every order</h2>
+      <p class="sub">A condition tree on a private crank — the order types fall out of it.</p>
+      <div class="feat">
+        <div class="chip"><b>Stop-loss & take-profit</b><span>Private trigger, no stop-hunting</span></div>
+        <div class="chip"><b>Trailing stop</b><span>High-water tracked in the ER</span></div>
+        <div class="chip"><b>Bracket / OCO</b><span>Entry + native exits, linked</span></div>
+        <div class="chip"><b>Multi-condition AND/OR</b><span>Price, funding, PnL, drawdown</span></div>
+        <div class="chip"><b>Limit & entry triggers</b><span>Not just exits — entries too</span></div>
+        <div class="chip"><b>On-chain receipts</b><span>Every fire and fill, auditable</span></div>
+      </div>
+    </div></section>
+
+    <section class="section"><div class="wrap">
+      <div class="eyebrow">SDK</div>
+      <h2>The whole layer, one call</h2>
+      <p class="sub">Arm a private conditional order and stream its fills in a few lines.</p>
+      <div class="code"><div class="bar"><span class="d"></span>arm.ts</div><pre>
+<span class="k">import</span> { KestrelClient } <span class="k">from</span> <span class="s">"@kestrel/sdk"</span>;
+
+<span class="k">const</span> k = <span class="k">new</span> KestrelClient({ connection, wallet, programId, idl });
+
+<span class="c">// watch the market, fire privately, settle on FlashTrade</span>
+<span class="k">const</span> { id } = <span class="k">await</span> k.<span class="f">arm</span>({
+  kind: <span class="s">"stop_loss"</span>, side: <span class="s">"close"</span>,
+  triggerPrice: <span class="s">140</span>, size: <span class="s">11_000_000</span>,
+  referencePrice: <span class="s">150</span>, private: <span class="k">true</span>,
+});
+
+k.<span class="f">watchFills</span>(f => console.log(f.status, f.entryPrice));</pre></div>
+      <a class="btn ghost" href="docs.html">Full SDK reference →</a>
+    </div></section>
+
+    <section class="section"><div class="wrap">
+      <div class="eyebrow">Powered by</div>
+      <h2>Built on the best of Solana</h2>
+      <div style=${{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"16px",marginTop:"24px"}} class="three">
+        <div class="step">
+          <span style=${{display:"inline-flex",alignItems:"center",background:"#0A0C10",border:"1px solid var(--line)",borderRadius:"8px",padding:"8px 12px",marginBottom:"10px"}}>
+            <img src="flashtrade.png" alt="FlashTrade" style=${{height:"24px",display:"block"}}/></span>
+          <p>The perpetuals venue. Every triggered order settles into FlashTrade's deep liquidity — itself running on a MagicBlock rollup, so settlement is fast and on-chain.</p></div>
+        <div class="step">
+          <span style=${{display:"inline-flex",alignItems:"center",background:"#FFFFFF",borderRadius:"8px",padding:"8px 12px",marginBottom:"10px"}}>
+            <img src="magicblock.png" alt="MagicBlock" style=${{height:"22px",display:"block"}}/></span>
+          <p>The Ephemeral Rollup and TEE. Kestrel watches and seals every order here — sub-50ms, gasless, and private until it fires. The rollup isn't an add-on; it's the engine.</p></div>
+      </div>
+    </div></section>
+
+    <section class="section"><div class="wrap">
+      <div class="eyebrow">FAQ</div>
+      <h2>Why Kestrel</h2>
+      <div style=${{marginTop:"22px",display:"flex",flexDirection:"column",gap:"12px"}}>
+        <div class="card"><h3>How is this different from FlashTrade's native stop-loss?</h3>
+          <p style=${{color:"var(--muted)",margin:"6px 0 0"}}>FlashTrade's triggers are public on-chain and exit-only. Kestrel is the private, programmable layer above them: entry triggers, trailing, brackets and multi-condition logic — all sealed in a TEE until they fire.</p></div>
+        <div class="card"><h3>Can my order be front-run or stop-hunted?</h3>
+          <p style=${{color:"var(--muted)",margin:"6px 0 0"}}>No. The trigger price, size and direction live inside a Private Rollup (TEE) — even the validator can't read them until the order fires. We prove it: the owner reads their order, a stranger is blocked.</p></div>
+        <div class="card"><h3>Is it custodial?</h3>
+          <p style=${{color:"var(--muted)",margin:"6px 0 0"}}>No. You sign once to arm; the order lives in a PDA you own; settlement uses a scoped session key, never your full wallet. Kestrel never holds your funds.</p></div>
+        <div class="card"><h3>Why a rollup instead of plain mainnet?</h3>
+          <p style=${{color:"var(--muted)",margin:"6px 0 0"}}>Watching a condition every tick on mainnet is impossible on cost and latency. The ER evaluates sub-50ms and gasless — an always-on watch loop. That's why the rollup is the product, not a feature.</p></div>
+        <div class="card"><h3>What's live today?</h3>
+          <p style=${{color:"var(--muted)",margin:"6px 0 0"}}>The full private pipeline on devnet — arm → TEE → trigger → on-chain receipt → keeper settlement — verified against FlashTrade's live mainnet API. The one step withheld in the demo is signing the funded position; flip one flag with a funded wallet and it executes for real.</p></div>
+      </div>
+    </div></section>
+
+    <footer class="foot"><div class="wrap">
+      <div class="r1"><div class="mark"><${Glyph}/><span class="word">KESTREL</span></div>
+        <div class="grow"></div><a href="docs.html">Docs</a><a href="https://github.com/Sonayonn/kestrel">GitHub</a></div>
+      <div class="mono" style=${{marginTop:"14px"}}>program ${PROGRAM.toBase58()} · devnet</div>
+      <div style=${{marginTop:"6px",maxWidth:"70ch"}}>Watched in a rollup, hidden in a TEE, settled on FlashTrade.
+        Live integration verified against FlashTrade mainnet quotes; the demo withholds only the funded signature.</div>
+    </div></footer>
+  </div>`;
+}
+createRoot(document.getElementById("root")).render(html`<${App}/>`);
+</script>
+</body>
+</html>

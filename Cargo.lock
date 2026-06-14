@@ -795,12 +795,15 @@ dependencies = [
  "getrandom 0.2.17",
  "magicblock-delegation-program-api",
  "magicblock-magic-program-api",
+ "num-derive",
+ "num-traits",
  "solana-account-info 2.3.0",
  "solana-address 2.6.0",
  "solana-program 2.3.0",
  "solana-program 3.0.0",
  "solana-program-error 2.2.2",
  "solana-system-interface 2.0.0",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
