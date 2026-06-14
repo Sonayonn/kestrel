@@ -47,6 +47,18 @@ code,pre,.mono{font-family:var(--mono)}
 .hero h1 .em{color:var(--rust)}
 .hero .lead{color:var(--muted);max-width:60ch;font-size:17px;margin:0 0 26px}
 .hero .cta{display:flex;gap:12px;flex-wrap:wrap}
+.herogrid{display:grid;grid-template-columns:1.05fr .95fr;gap:44px;align-items:center}
+@media(max-width:880px){.herogrid{grid-template-columns:1fr}.herocard{display:none}}
+.herocard{position:relative;background:linear-gradient(160deg,#16202b,#10161d);border:1px solid var(--line2);border-radius:18px;padding:32px 30px;overflow:hidden;
+  box-shadow:0 0 0 1px rgba(226,100,60,.06),0 30px 60px -22px rgba(226,100,60,.28),0 0 90px -30px rgba(47,182,166,.4)}
+.herocard::before{content:"";position:absolute;inset:-40%;pointer-events:none;
+  background:radial-gradient(circle at 28% 18%,rgba(226,100,60,.20),transparent 46%),radial-gradient(circle at 82% 92%,rgba(47,182,166,.18),transparent 46%)}
+.herocard .tag{position:relative;font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--teal);display:flex;align-items:center;gap:7px}
+.herocard .tag i{width:7px;height:7px;border-radius:50%;background:var(--teal);box-shadow:0 0 10px var(--teal)}
+.herocard h3{position:relative;font-family:var(--disp);font-weight:700;font-size:27px;line-height:1.18;margin:18px 0 16px;color:var(--text)}
+.herocard .ln{position:relative;font-family:var(--mono);font-size:12px;color:var(--muted);border-top:1px solid var(--line);padding-top:14px}
+@media(prefers-reduced-motion: no-preference){.herocard{animation:float 6s ease-in-out infinite}
+  @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-10px)}}}
 
 /* ---- sections ---- */
 .section{padding:46px 0;border-top:1px solid var(--line)}

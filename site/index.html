@@ -4,6 +4,7 @@
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Kestrel — private, programmable conditional orders for Solana perps</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -107,13 +108,20 @@ function App(){
       <button class=${"btn "+(pk?"ghost":"")} onClick=${pk?disconnect:connect} title=${pk?"Click to disconnect":"Connect Phantom"}>${pk?short(pk.toBase58())+" ✕":"Connect Phantom"}</button>
     </div></nav>
 
-    <header class="hero wrap">
-      <div class="eyebrow">Conditional order layer · Solana perps</div>
-      <h1>Orders that <span class="em">watch the market</span> and strike — invisible until they execute.</h1>
-      <p class="lead">Kestrel arms your stop-losses, take-profits, trailing stops and brackets inside a MagicBlock
-        rollup, sealed in a TEE — so the trigger price stays hidden from front-runners until the instant it fires.
-        On-chain, non-custodial, sub-second.</p>
-      <div class="cta"><a class="btn" href="#console">Try the console</a><a class="btn ghost" href="docs.html">Read the SDK docs</a></div>
+    <header class="hero wrap herogrid">
+      <div>
+        <div class="eyebrow">Conditional order layer · Solana perps</div>
+        <h1>Orders that <span class="em">watch the market</span> and strike — invisible until they execute.</h1>
+        <p class="lead">Kestrel arms your stop-losses, take-profits, trailing stops and brackets inside a MagicBlock
+          rollup, sealed in a TEE — so the trigger price stays hidden from front-runners until the instant it fires.
+          On-chain, non-custodial, sub-second.</p>
+        <div class="cta"><a class="btn" href="#console">Try the console</a><a class="btn ghost" href="docs.html">Read the SDK docs</a></div>
+      </div>
+      <div class="herocard">
+        <div class="tag"><i></i>sealed in TEE</div>
+        <h3>Enter and exit the market without the world watching.</h3>
+        <div class="ln">trigger · size · direction — hidden until it fires</div>
+      </div>
     </header>
 
     <section class="section" id="console"><div class="wrap">
